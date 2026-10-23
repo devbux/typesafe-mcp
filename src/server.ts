@@ -44,8 +44,23 @@ function isEntryValue(value: unknown): boolean {
   );
 }
 
-const BASE64_RE =
-  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+/**
+ * Stack-safe base64 shape check: standard alphabet, `=` padding only at
+ * the end, total length a multiple of 4, no whitespace. A single regex
+ * over a multi-megabyte string can overflow the regex engine's stack,
+ * so the character set is tested in chunks.
+ */
+function isValidBase64(value: string): boolean {
+  if (value.length === 0 || value.length % 4 !== 0) return false;
+  if (/\s/.test(value)) return false;
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  const body = padding > 0 ? value.slice(0, -padding) : value;
+  if (body.includes("=")) return false;
+  for (let i = 0; i < body.length; i += 8192) {
+    if (!/^[A-Za-z0-9+/]+$/.test(body.slice(i, i + 8192))) return false;
+  }
+  return true;
+}
 
 /** Images for a request, keyed by reference string (see the Images docs). */
 const assetsSchema = z.record(
@@ -60,10 +75,10 @@ const assetsSchema = z.record(
     data_base64: z
       .string()
       .min(1)
-      .regex(
-        BASE64_RE,
-        "data_base64 must be standard base64 with padding and no data: prefix",
-      ),
+      .refine(isValidBase64, {
+        message:
+          "data_base64 must be standard base64 with padding and no data: prefix",
+      }),
     format: z.enum(["png", "jpg", "jpeg"]),
   }),
 );
@@ -254,7 +269,7 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
 
   const server = new McpServer({
     name: "typesafe-mcp",
-    version: "0.2.0",
+    version: "0.2.1",
   });
 
   server.registerTool(

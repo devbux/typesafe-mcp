@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-23
+
+### Fixed
+
+- Base64 validation for image `assets` no longer uses a single regular
+  expression over the whole string: on multi-megabyte inputs (a valid
+  image can be several MB of base64) the regex engine could overflow its
+  stack and crash validation. The check is now chunked and stack-safe,
+  with the same accepted shape (standard alphabet, `=` padding, no
+  whitespace, no `data:` prefix).
+
 ## [0.2.0] - 2026-10-23
 
 ### Added
