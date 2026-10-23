@@ -1,0 +1,1 @@
+{"mcpServers":{"typesafe":{"args":["-y","@devbux/typesafe-mcp"],"command":"npx","env":{"TYPESAFE_API_KEY":"YOUR_TYPESAFE_API_KEY"}}}}
