@@ -6,6 +6,7 @@ import { loadConfig, type TypesafeConfig } from "./config.js";
 import { JevClient } from "./jev/client.js";
 import type {
   ChoiceCriteria,
+  JevEntry,
   JevQuestion,
   NoulCriteria,
   ScoreCriteria,
@@ -21,17 +22,105 @@ const stateSchema = z.union([
   z.array(z.unknown()),
 ]);
 
-const criteriaValueSchema = z.union([z.string(), z.null()]);
+/** A Jev entry: text, structured JSON (object or array), or null. */
+const entrySchema = z.union([
+  z.string(),
+  z.record(z.string(), z.unknown()),
+  z.array(z.unknown()),
+  z.null(),
+]);
+
+/** Instructions for choice/score/noul: an entry; strings must not be empty. */
+const instructionsSchema = z.union([
+  z.string().min(1, "instructions must not be empty"),
+  z.record(z.string(), z.unknown()),
+  z.array(z.unknown()),
+  z.null(),
+]);
+
+function isEntryValue(value: unknown): boolean {
+  return (
+    value === null || typeof value === "string" || typeof value === "object"
+  );
+}
+
+const BASE64_RE =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/** Images for a request, keyed by reference string (see the Images docs). */
+const assetsSchema = z.record(
+  z
+    .string()
+    .refine(
+      (ref) => ref.trim().length > 0 && ref.length <= 1024,
+      "asset references must be non-empty and at most 1024 characters",
+    ),
+  z.object({
+    kind: z.literal("image").optional(),
+    data_base64: z
+      .string()
+      .min(1)
+      .regex(
+        BASE64_RE,
+        "data_base64 must be standard base64 with padding and no data: prefix",
+      ),
+    format: z.enum(["png", "jpg", "jpeg"]),
+  }),
+);
+
+const ASSETS_DESCRIPTION =
+  "Images keyed by reference string. Write each reference in the state, " +
+  "instructions, or criteria where the image belongs. PNG or JPEG only, " +
+  "base64-encoded with no data: prefix. API limits: 16 MiB per image, " +
+  "280-1568 px per side.";
+
+const longContextSchema = z
+  .boolean()
+  .optional()
+  .describe(
+    "Opt into Jev's 262k long-context limits (an experimental danger-zone " +
+      "feature: slower and less accurate).",
+  );
 
 /** One typed question for `jev_decide`, validated per question type. */
 const questionSchema = z
   .object({
-    type: z.enum(["choice", "score", "noul"]),
-    instructions: z.string().min(1, "instructions must not be empty"),
+    type: z.enum(["choice", "score", "noul", "box"]),
+    instructions: z.unknown(),
     criteria: z.unknown().optional(),
   })
   .superRefine((question, ctx) => {
-    const { type, criteria } = question;
+    const { type, criteria, instructions } = question;
+    if (type === "box") {
+      if (typeof instructions !== "string" || instructions.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "box questions require instructions: a non-empty string naming what to find and in which image",
+          path: ["instructions"],
+        });
+      }
+      if (criteria !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "box questions take no criteria",
+          path: ["criteria"],
+        });
+      }
+      return;
+    }
+    if (
+      !isEntryValue(instructions) ||
+      (typeof instructions === "string" && instructions.length === 0)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "instructions must be a non-empty string, a structured object or array, or null",
+        path: ["instructions"],
+      });
+      return;
+    }
     if (type === "choice") {
       if (!isPlainObject(criteria)) {
         ctx.addIssue({
@@ -51,10 +140,10 @@ const questionSchema = z
         });
       }
       for (const [label, value] of Object.entries(criteria)) {
-        if (typeof value !== "string" && value !== null) {
+        if (!isEntryValue(value)) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
-            message: `choice option "${label}" must map to a description string or null`,
+            message: `choice option "${label}" must map to a description: a string, a structured object or array, or null`,
             path: ["criteria", label],
           });
         }
@@ -63,12 +152,12 @@ const questionSchema = z
       if (
         !Array.isArray(criteria) ||
         criteria.length < 2 ||
-        !criteria.every((level) => typeof level === "string")
+        !criteria.every((level) => isEntryValue(level))
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message:
-            "score questions require criteria: an array of at least 2 ordered level descriptions (strings)",
+            "score questions require criteria: an array of at least 2 ordered level descriptions (strings or structured objects/arrays)",
           path: ["criteria"],
         });
       }
@@ -83,10 +172,10 @@ const questionSchema = z
           });
         } else {
           for (const [label, value] of Object.entries(criteria)) {
-            if (typeof value !== "string" && value !== null) {
+            if (!isEntryValue(value)) {
               ctx.addIssue({
                 code: z.ZodIssueCode.custom,
-                message: `noul criteria "${label}" must map to a description string or null`,
+                message: `noul criteria "${label}" must map to a description: a string, a structured object or array, or null`,
                 path: ["criteria", label],
               });
             }
@@ -106,23 +195,25 @@ function toJevQuestion(question: z.infer<typeof questionSchema>): JevQuestion {
     case "choice":
       return {
         type: "choice",
-        instructions: question.instructions,
+        instructions: question.instructions as JevEntry,
         criteria: question.criteria as ChoiceCriteria,
       };
     case "score":
       return {
         type: "score",
-        instructions: question.instructions,
+        instructions: question.instructions as JevEntry,
         criteria: question.criteria as ScoreCriteria,
       };
     case "noul":
       return question.criteria === undefined
-        ? { type: "noul", instructions: question.instructions }
+        ? { type: "noul", instructions: question.instructions as JevEntry }
         : {
             type: "noul",
-            instructions: question.instructions,
+            instructions: question.instructions as JevEntry,
             criteria: question.criteria as NoulCriteria,
           };
+    case "box":
+      return { type: "box", instructions: question.instructions as string };
   }
 }
 
@@ -163,7 +254,7 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
 
   const server = new McpServer({
     name: "typesafe-mcp",
-    version: "0.1.0",
+    version: "0.2.0",
   });
 
   server.registerTool(
@@ -172,9 +263,11 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
       title: "Jev: decide (multiple typed questions)",
       description:
         "Ask TypeSafe AI's Jev decision model one or more typed questions " +
-        "(choice, score and/or noul) about a state in a single call. Returns " +
-        "typed answers with calibrated probabilities. The state may be text " +
-        "or structured JSON.",
+        "(choice, score, noul and/or box) about a state in a single call. " +
+        "Returns typed answers with calibrated probabilities. The state may " +
+        "be text or structured JSON. Images: pass them in `assets` and " +
+        "write each image's reference in the state, instructions, or " +
+        "criteria where it belongs.",
       inputSchema: {
         state: stateSchema.describe(
           "The situation to decide about: text, a JSON object, or a JSON array.",
@@ -187,19 +280,25 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
           )
           .describe(
             "Map of question name to typed question. Each question has a " +
-              "type (choice | score | noul), instructions, and criteria: " +
-              "choice = object of option label -> description or null " +
-              "(2-255 options); score = array of at least 2 ordered level " +
-              "descriptions; noul = optional object of true/false descriptions.",
+              "type (choice | score | noul | box), instructions, and " +
+              "criteria: choice = object of option label -> description " +
+              "(string, structured object/array, or null; 2-255 options); " +
+              "score = array of at least 2 ordered level descriptions " +
+              "(strings or structured entries); noul = optional object of " +
+              "true/false descriptions; box = instructions only, no " +
+              "criteria (finds where something is in an image). " +
+              "Instructions may be text or structured JSON.",
           ),
         model: z
           .string()
           .min(1)
           .optional()
           .describe("Optional Jev model id override (default: jev-latest)."),
+        assets: assetsSchema.optional().describe(ASSETS_DESCRIPTION),
+        long_context: longContextSchema,
       },
     },
-    async ({ state, questions, model }) => {
+    async ({ state, questions, model, assets, long_context }) => {
       try {
         const typed: Record<string, JevQuestion> = {};
         for (const [name, question] of Object.entries(questions)) {
@@ -209,6 +308,8 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
           state,
           questions: typed,
           ...(model ? { model } : {}),
+          ...(assets ? { assets } : {}),
+          ...(long_context ? { longContext: true } : {}),
         });
         return textResult(result);
       } catch (err) {
@@ -230,12 +331,11 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
         state: stateSchema.describe(
           "The situation to decide about: text, a JSON object, or a JSON array.",
         ),
-        instructions: z
-          .string()
-          .min(1)
-          .describe("What Jev should decide, in plain language."),
+        instructions: instructionsSchema.describe(
+          "What Jev should decide: plain-language text, or structured JSON.",
+        ),
         options: z
-          .record(z.string(), criteriaValueSchema)
+          .record(z.string(), entrySchema)
           .refine(
             (options) => {
               const count = Object.keys(options).length;
@@ -244,16 +344,18 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
             "choice questions require between 2 and 255 options",
           )
           .describe(
-            "Object mapping each option label to a description string or null (2-255 options).",
+            "Object mapping each option label to a description (string, structured object/array, or null; 2-255 options). An option can be defined by example pictures: put image references in its description.",
           ),
         model: z
           .string()
           .min(1)
           .optional()
           .describe("Optional Jev model id override (default: jev-latest)."),
+        assets: assetsSchema.optional().describe(ASSETS_DESCRIPTION),
+        long_context: longContextSchema,
       },
     },
-    async ({ state, instructions, options, model }) => {
+    async ({ state, instructions, options, model, assets, long_context }) => {
       try {
         const result = await client.decide({
           state,
@@ -265,6 +367,8 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
             },
           },
           ...(model ? { model } : {}),
+          ...(assets ? { assets } : {}),
+          ...(long_context ? { longContext: true } : {}),
         });
         return textResult(result);
       } catch (err) {
@@ -286,24 +390,25 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
         state: stateSchema.describe(
           "The situation to decide about: text, a JSON object, or a JSON array.",
         ),
-        instructions: z
-          .string()
-          .min(1)
-          .describe("What Jev should rate, in plain language."),
+        instructions: instructionsSchema.describe(
+          "What Jev should rate: plain-language text, or structured JSON.",
+        ),
         levels: z
-          .array(z.string())
+          .array(entrySchema)
           .min(2, "score questions require at least 2 levels")
           .describe(
-            "Ordered level descriptions, lowest to highest (at least 2).",
+            "Ordered level descriptions, lowest to highest (at least 2). Each level may be a string or a structured entry, and may hold image references as examples.",
           ),
         model: z
           .string()
           .min(1)
           .optional()
           .describe("Optional Jev model id override (default: jev-latest)."),
+        assets: assetsSchema.optional().describe(ASSETS_DESCRIPTION),
+        long_context: longContextSchema,
       },
     },
-    async ({ state, instructions, levels, model }) => {
+    async ({ state, instructions, levels, model, assets, long_context }) => {
       try {
         const result = await client.decide({
           state,
@@ -315,6 +420,8 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
             },
           },
           ...(model ? { model } : {}),
+          ...(assets ? { assets } : {}),
+          ...(long_context ? { longContext: true } : {}),
         });
         return textResult(result);
       } catch (err) {
@@ -335,24 +442,25 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
         state: stateSchema.describe(
           "The situation to decide about: text, a JSON object, or a JSON array.",
         ),
-        instructions: z
-          .string()
-          .min(1)
-          .describe("The proposition Jev should assess, in plain language."),
+        instructions: instructionsSchema.describe(
+          "The proposition Jev should assess: plain-language text, or structured JSON.",
+        ),
         criteria: z
-          .record(z.string(), criteriaValueSchema)
+          .record(z.string(), entrySchema)
           .optional()
           .describe(
-            'Optional descriptions keyed by "true" / "false" explaining what each outcome means.',
+            'Optional descriptions keyed by "true" / "false" explaining what each outcome means. Values may be strings, structured objects/arrays, or null, and may hold image references.',
           ),
         model: z
           .string()
           .min(1)
           .optional()
           .describe("Optional Jev model id override (default: jev-latest)."),
+        assets: assetsSchema.optional().describe(ASSETS_DESCRIPTION),
+        long_context: longContextSchema,
       },
     },
-    async ({ state, instructions, criteria, model }) => {
+    async ({ state, instructions, criteria, model, assets, long_context }) => {
       try {
         const result = await client.decide({
           state,
@@ -364,6 +472,61 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
             },
           },
           ...(model ? { model } : {}),
+          ...(assets ? { assets } : {}),
+          ...(long_context ? { longContext: true } : {}),
+        });
+        return textResult(result);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "jev_box",
+    {
+      title: "Jev: box question (find where something is in an image)",
+      description:
+        "Ask Jev a single Box question: locate one target in an image. " +
+        "Returns the box edges as fractions of the image size (top, " +
+        "bottom, left, right, each 0..1) plus a confidence value, under " +
+        'the question name "answer". The image must be in the request: ' +
+        "reference it from the state or the instructions and pass it in " +
+        "assets. Box needs Jev 1.14, so this tool sends jev-1.14.0 " +
+        "unless you pass another model (jev-preview also works). " +
+        "A Box answer is always a box, even when the target is absent; " +
+        "pair it with jev_noul when you need a presence check.",
+      inputSchema: {
+        state: stateSchema.describe(
+          "The situation: text, a JSON object, or a JSON array. Reference the image here (or in the instructions) where it belongs.",
+        ),
+        instructions: z
+          .string()
+          .min(1)
+          .describe(
+            'What to find, and in which image: e.g. "the coffee mug in `photo`".',
+          ),
+        assets: assetsSchema.optional().describe(ASSETS_DESCRIPTION),
+        model: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Optional Jev model id override (default: jev-1.14.0, because Box requires Jev 1.14).",
+          ),
+        long_context: longContextSchema,
+      },
+    },
+    async ({ state, instructions, assets, model, long_context }) => {
+      try {
+        const result = await client.decide({
+          state,
+          questions: {
+            [SINGLE_QUESTION_NAME]: { type: "box", instructions },
+          },
+          model: model ?? "jev-1.14.0",
+          ...(assets ? { assets } : {}),
+          ...(long_context ? { longContext: true } : {}),
         });
         return textResult(result);
       } catch (err) {

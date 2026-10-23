@@ -68,15 +68,33 @@ export class JevClient {
       }
     }
 
+    const assets = request.assets;
+    const hasAssets = assets !== undefined && Object.keys(assets).length > 0;
+    if (hasAssets) {
+      assertAssetsReferenced(assets, request.state, questions);
+    }
+    const hasBox = Object.values(questions).some((q) => q.type === "box");
+
     const body = {
       model: request.model ?? this.model,
       state: request.state,
       questions,
+      ...(hasAssets ? { assets } : {}),
     };
+
+    const headers: Record<string, string> = {};
+    if (hasAssets || hasBox) {
+      // Images and Box questions are opt-in "danger zone" features.
+      headers["TypeSafe-Danger-Zone-Images"] = "true";
+    }
+    if (request.longContext) {
+      headers["TypeSafe-Danger-Zone-Long-Context"] = "true";
+    }
 
     const data = await this.requestJson<unknown>("/v1/systemone", {
       method: "POST",
       body: JSON.stringify(body),
+      headers,
     });
 
     if (
@@ -122,7 +140,7 @@ export class JevClient {
 
   private async requestJson<T>(
     path: string,
-    init: { method: string; body?: string },
+    init: { method: string; body?: string; headers?: Record<string, string> },
   ): Promise<T> {
     const apiKey = this.requireApiKey();
     const url = `${this.baseUrl}${path}`;
@@ -137,6 +155,7 @@ export class JevClient {
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
+          ...(init.headers ?? {}),
         },
         ...(init.body !== undefined ? { body: init.body } : {}),
         signal: controller.signal,
@@ -175,6 +194,40 @@ export class JevClient {
       );
     }
     return parsed as T;
+  }
+}
+
+/** Collect every string value anywhere inside a JSON-shaped value. */
+function collectStrings(value: unknown, out: string[]): void {
+  if (typeof value === "string") {
+    out.push(value);
+  } else if (Array.isArray(value)) {
+    for (const item of value) collectStrings(item, out);
+  } else if (typeof value === "object" && value !== null) {
+    for (const item of Object.values(value)) collectStrings(item, out);
+  }
+}
+
+/**
+ * The API rejects a request whose assets are not referenced anywhere
+ * (HTTP 400). Fail fast with a clearer message instead. Object keys are
+ * not searched: the API does not replace references in keys.
+ */
+function assertAssetsReferenced(
+  assets: Record<string, unknown>,
+  state: unknown,
+  questions: unknown,
+): void {
+  const strings: string[] = [];
+  collectStrings(state, strings);
+  collectStrings(questions, strings);
+  for (const ref of Object.keys(assets)) {
+    if (!strings.some((s) => s.includes(ref))) {
+      throw new JevError(
+        `Image asset "${ref}" is not referenced anywhere in the state, ` +
+          "instructions, or criteria. Write the reference where the image belongs.",
+      );
+    }
   }
 }
 

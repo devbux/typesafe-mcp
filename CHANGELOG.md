@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-10-23
+
+### Added
+
+- **Image support** (TypeSafe "danger zone" feature): all decision tools
+  accept an `assets` map of base64-encoded PNG/JPEG images keyed by
+  reference string. References are written into the `state`,
+  `instructions`, or `criteria` where each image belongs. The client sends
+  the `TypeSafe-Danger-Zone-Images: true` header automatically whenever a
+  request carries assets or a Box question, and rejects unreferenced
+  assets locally with a clear error (the API would return 400).
+- **Box question type** and a new `jev_box` tool: locate one target in an
+  image and get its bounding-box edges (`top`, `bottom`, `left`, `right`
+  as fractions 0..1) plus a confidence value. Box requires Jev 1.14, so
+  `jev_box` sends `jev-1.14.0` by default. Box questions can also be mixed
+  into `jev_decide` calls.
+- **Long context opt-in**: decision tools accept `long_context: true`,
+  which sends the `TypeSafe-Danger-Zone-Long-Context: true` header and
+  raises the context limits from 64k/32k to 262k tokens.
+- Structured `instructions` and `criteria`: per the current TypeSafe docs,
+  these fields accept JSON objects/arrays (or null) as well as strings —
+  e.g. Choice options and Score levels defined by structured entries
+  holding example images.
+
 ## [0.1.0] - 2026-10-23
 
 ### Added

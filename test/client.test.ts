@@ -145,6 +145,91 @@ describe("JevClient.decide", () => {
   });
 });
 
+describe("JevClient images, box and long context", () => {
+  const pngAsset = { data_base64: "aGVsbG8=", format: "png" as const };
+
+  it("sends assets in the body and sets the images header when an asset is referenced", async () => {
+    const { impl, calls } = fakeFetch(() => jsonResponse(200, sampleAnswers));
+    const client = new JevClient({ apiKey: "k", fetchImpl: impl });
+
+    await client.decide({
+      state: "Doorbell photo: doorbell_img",
+      questions: {
+        person: { type: "noul", instructions: "Is a person visible in doorbell_img?" },
+      },
+      assets: { doorbell_img: pngAsset },
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.headers["TypeSafe-Danger-Zone-Images"]).toBe("true");
+    expect(calls[0]?.headers["TypeSafe-Danger-Zone-Long-Context"]).toBeUndefined();
+    expect(calls[0]?.body).toMatchObject({
+      assets: { doorbell_img: { data_base64: "aGVsbG8=", format: "png" } },
+    });
+  });
+
+  it("sets the images header for a box question and returns the box answer", async () => {
+    const payload = {
+      answers: {
+        mug: {
+          type: "box",
+          box: { top: 0.1, bottom: 0.5, left: 0.2, right: 0.6 },
+          confidence: 0.83,
+        },
+      },
+      model: "jev-1.14.0",
+    };
+    const { impl, calls } = fakeFetch(() => jsonResponse(200, payload));
+    const client = new JevClient({ apiKey: "k", fetchImpl: impl });
+
+    const result = await client.decide({
+      model: "jev-1.14.0",
+      state: { photo: "kitchen_img" },
+      questions: {
+        mug: { type: "box", instructions: "the coffee mug in `kitchen_img`" },
+      },
+      assets: { kitchen_img: pngAsset },
+    });
+
+    expect(calls[0]?.headers["TypeSafe-Danger-Zone-Images"]).toBe("true");
+    expect(calls[0]?.body).toMatchObject({ model: "jev-1.14.0" });
+    expect(result.answers.mug).toMatchObject({
+      type: "box",
+      box: { top: 0.1, bottom: 0.5, left: 0.2, right: 0.6 },
+      confidence: 0.83,
+    });
+  });
+
+  it("rejects an unreferenced asset before calling fetch", async () => {
+    const { impl, calls } = fakeFetch(() => jsonResponse(200, sampleAnswers));
+    const client = new JevClient({ apiKey: "k", fetchImpl: impl });
+
+    await expect(
+      client.decide({
+        state: "no images here",
+        questions: { q: { type: "noul", instructions: "Is it true?" } },
+        assets: { unused_img: pngAsset },
+      }),
+    ).rejects.toThrow(/not referenced/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("sets the long-context header when longContext is true, and no images header for a plain request", async () => {
+    const { impl, calls } = fakeFetch(() => jsonResponse(200, sampleAnswers));
+    const client = new JevClient({ apiKey: "k", fetchImpl: impl });
+
+    await client.decide({
+      state: "a very long state",
+      questions: { q: { type: "noul", instructions: "Is it true?" } },
+      longContext: true,
+    });
+
+    expect(calls[0]?.headers["TypeSafe-Danger-Zone-Long-Context"]).toBe("true");
+    expect(calls[0]?.headers["TypeSafe-Danger-Zone-Images"]).toBeUndefined();
+    expect(calls[0]?.body).not.toHaveProperty("assets");
+  });
+});
+
 describe("JevClient.listModels", () => {
   it("GETs /v1/models and parses the models array", async () => {
     const payload = {

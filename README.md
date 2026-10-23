@@ -23,6 +23,12 @@ and Jev returns **typed answers with calibrated probabilities**:
 | `choice` | 2–255 labelled options (each with an optional description) | the chosen option, a confidence value, and a probability for every option |
 | `score` | an ordered scale of level descriptions (at least 2) | a numeric score on your scale, confidence, and per-level probabilities |
 | `noul` | a proposition (optionally with true/false descriptions) | a calibrated probability (0..1) that the proposition is true |
+| `box` | what to find, and in which image | the target's bounding-box edges (`top`, `bottom`, `left`, `right` as fractions 0..1) and a confidence value |
+
+Questions can also read **images**: pass pictures in an `assets` map and
+reference them from the `state`, `instructions`, or `criteria` — see
+[Images](#images). `instructions` and `criteria` accept structured JSON
+(objects/arrays), not just strings.
 
 Because the output is structured and calibrated rather than free text, Jev is
 well suited to routing, triage, moderation, risk scoring, prioritisation, and
@@ -145,11 +151,15 @@ never your API key.
 
 | Tool | Inputs | Output |
 | --- | --- | --- |
-| `jev_decide` | `state` (string \| JSON object \| JSON array), `questions` (map of name → typed question, at least 1), optional `model` | All answers in one call: `{ answers, model, usage }` |
-| `jev_choice` | `state`, `instructions`, `options` (object: label → description or `null`, 2–255), optional `model` | One Choice answer under the name `answer` |
-| `jev_score` | `state`, `instructions`, `levels` (array of level descriptions, at least 2, ordered low → high), optional `model` | One Score answer under the name `answer` |
-| `jev_noul` | `state`, `instructions`, optional `criteria` (`{ "true": ..., "false": ... }` descriptions), optional `model` | One Noul answer (probability 0..1) under the name `answer` |
+| `jev_decide` | `state` (string \| JSON object \| JSON array), `questions` (map of name → typed question, at least 1), optional `model`, `assets`, `long_context` | All answers in one call: `{ answers, model, usage }` |
+| `jev_choice` | `state`, `instructions`, `options` (object: label → description or `null`, 2–255), optional `model`, `assets`, `long_context` | One Choice answer under the name `answer` |
+| `jev_score` | `state`, `instructions`, `levels` (array of level descriptions, at least 2, ordered low → high), optional `model`, `assets`, `long_context` | One Score answer under the name `answer` |
+| `jev_noul` | `state`, `instructions`, optional `criteria` (`{ "true": ..., "false": ... }` descriptions), optional `model`, `assets`, `long_context` | One Noul answer (probability 0..1) under the name `answer` |
+| `jev_box` | `state`, `instructions` (what to find, and in which image), optional `assets`, `model` (default `jev-1.14.0`), `long_context` | One Box answer (`box` edges + confidence) under the name `answer` |
 | `jev_list_models` | _(none)_ | `{ models: [{ name, description, release_date }] }` |
+
+`assets` and `long_context` are described under [Images](#images) and
+[Long context](#long-context).
 
 ### Question shapes for `jev_decide`
 
@@ -176,6 +186,71 @@ never your API key.
   // "criteria" is optional for noul and omitted when not provided
 }
 ```
+
+```jsonc
+{
+  "type": "box",
+  "instructions": "the coffee mug in `kitchen_photo`"
+  // box takes no criteria; it needs an image in the request and Jev 1.14
+}
+```
+
+## Images
+
+An image can go anywhere text can go in a request: in the `state`, in a
+question's `instructions`, and in its `criteria`. Every decision tool accepts
+an optional `assets` argument — a map from a **reference string** to an
+image, base64-encoded:
+
+```json
+{
+  "state": "Doorbell camera frame: doorbell_img",
+  "questions": {
+    "person_at_door": {
+      "type": "noul",
+      "instructions": "Is a person visible in doorbell_img?"
+    },
+    "person_where": {
+      "type": "box",
+      "instructions": "the person in `doorbell_img`"
+    }
+  },
+  "assets": {
+    "doorbell_img": { "data_base64": "<base64, no data: prefix>", "format": "jpg" }
+  },
+  "model": "jev-1.14.0"
+}
+```
+
+Rules from the TypeSafe docs:
+
+- Write each asset's reference wherever the image belongs (whole value or
+  inside a longer string). Every asset must be referenced at least once, or
+  the API returns `400` — this server checks that before sending. Use
+  distinctive references (a UUID is safest): references match as plain text,
+  so a short one like `cat` could also match inside `category`.
+- Formats: **PNG or JPEG** only, still images. Each image: at most **16 MiB**,
+  each side **280–1568 px**; the request body and all images together are
+  capped at 32 MiB. Images are never resized by the API — prepare them
+  (upright, within the limits) before sending.
+- Images are an opt-in "danger zone" feature: the server automatically sends
+  the `TypeSafe-Danger-Zone-Images: true` header whenever a request has
+  assets or a Box question. TypeSafe marks these features experimental —
+  formats and limits may change between releases.
+- Jev **1.13 and 1.14** both accept images. **Box questions need Jev 1.14**:
+  send `jev-1.14.0` or `jev-preview` as the model (`jev_box` defaults to
+  `jev-1.14.0`). A Box answer is always a box, even when the target is
+  absent — pair it with a `noul` presence check when that matters.
+- The API also accepts multipart uploads; MCP tool calls carry JSON, so this
+  server always uses the base64 form.
+
+## Long context
+
+Jev's default context limits are 64k tokens per request and 32k per
+question. Any decision tool accepts `long_context: true`, which sends the
+`TypeSafe-Danger-Zone-Long-Context: true` header and raises both limits to
+262k tokens. TypeSafe marks this experimental too: it is slower and less
+accurate, so use it only when a request does not fit the default limits.
 
 ## Worked example
 
@@ -256,7 +331,7 @@ Project layout:
 ```text
 src/
   index.ts       stdio bootstrap
-  server.ts      MCP server + the five jev_* tools (zod-validated)
+  server.ts      MCP server + the six jev_* tools (zod-validated)
   config.ts      environment parsing (TYPESAFE_*)
   jev/
     client.ts    typed JevClient for POST /v1/systemone and GET /v1/models
